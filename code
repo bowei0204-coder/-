@@ -1,0 +1,416 @@
+"""
+採檢預約單批次產生器
+
+功能：
+1. 讀取「問卷表單.xlsx」每一筆資料
+2. 套入「立人採檢預約單_外縣市1140722新版.xlsx」模板
+3. 每筆資料各產生一個新的 xlsx
+
+使用方式：
+python generate_sampling_orders_app.py
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import datetime, date, time
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox
+
+from openpyxl import load_workbook
+
+
+# =====================================================
+# 這裡是模板要填入的位置
+# 如果之後模板格子位置改了，主要改這裡就好
+# =====================================================
+
+TEMPLATE_SHEET = "委託單-個別通知"
+
+TARGET_CELLS = {
+    "name": "D5",       # 姓名
+    "id_no": "D6",      # 身分證或護照號
+    "birthday": "D7",   # 生日
+    "lab": "D9",        # 檢驗所
+    "address": "D10",   # 檢驗所地址
+    "year": "C11",      # 採檢日期：年
+    "month": "E11",     # 採檢日期：月
+    "day": "G11",       # 採檢日期：日
+    "hour": "C12",      # 預計時間：時
+    "minute": "F12",    # 預計時間：分
+}
+
+
+# =====================================================
+# 這裡是問卷表單的欄位名稱
+# 要跟 Excel 第一列標題對得上
+# =====================================================
+
+COL_NAME = "姓名"
+COL_ID = "身分證(護照)號 "
+COL_BIRTHDAY = "生日 "
+COL_LAB = "請選擇預約採檢單位"
+COL_SAMPLE_DATE = "請填寫預約採檢日期"
+COL_SAMPLE_TIME = "請填寫預計預約採檢時間"
+
+
+# =====================================================
+# 工具函式
+# =====================================================
+
+def clean_text(value) -> str:
+    """把 Excel 讀到的值轉成乾淨文字。"""
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def safe_filename(text: str) -> str:
+    """移除 Windows 檔名不能用的字元。"""
+    text = clean_text(text)
+    text = re.sub(r'[\\/:*?"<>|]', "-", text)
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def parse_lab(raw_lab: str) -> tuple[str, str, str, str]:
+    """
+    把檢驗所欄位拆開。
+
+    例如：
+    南投 - 貝爾醫事檢驗所 (南投縣南投市彰南路二段27號)
+
+    會拆成：
+    area = 南投
+    lab_name = 貝爾醫事檢驗所
+    address = 南投縣南投市彰南路二段27號
+    display_lab = 南投 - 貝爾醫事檢驗所
+    """
+
+    raw_lab = clean_text(raw_lab)
+
+    match = re.match(r"^(.*?)\s*-\s*(.*?)\s*\((.*?)\)\s*$", raw_lab)
+
+    if match:
+        area = clean_text(match.group(1))
+        lab_name = clean_text(match.group(2))
+        address = clean_text(match.group(3))
+        display_lab = f"{area} - {lab_name}"
+        return area, lab_name, address, display_lab
+
+    # 如果格式不符合，就不要讓程式直接炸掉
+    return "", raw_lab, "", raw_lab
+
+
+def parse_date(value) -> date:
+    """解析日期。支援 Excel 日期、2026/10/22、2026-10-22、20261022。"""
+
+    if isinstance(value, datetime):
+        return value.date()
+
+    if isinstance(value, date):
+        return value
+
+    text = clean_text(value)
+
+    for fmt in ["%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d", "%Y%m%d"]:
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            pass
+
+    raise ValueError(f"無法解析日期：{value}")
+
+
+def parse_time(value) -> time:
+    """解析時間。支援上午 9:00:00、下午 4:00:00、09:00。"""
+
+    if isinstance(value, datetime):
+        return value.time()
+
+    if isinstance(value, time):
+        return value
+
+    text = clean_text(value)
+
+    # Google 表單常見中文時間
+    text = text.replace("上午", "AM ")
+    text = text.replace("下午", "PM ")
+
+    for fmt in ["%p %I:%M:%S", "%p %I:%M", "%H:%M:%S", "%H:%M"]:
+        try:
+            return datetime.strptime(text, fmt).time()
+        except ValueError:
+            pass
+
+    raise ValueError(f"無法解析時間：{value}")
+
+
+def find_header_map(ws) -> dict[str, int]:
+    """
+    讀取問卷表單第一列標題。
+
+    回傳格式：
+    {
+        "姓名": 1,
+        "生日": 2,
+        ...
+    }
+    """
+
+    header_map = {}
+
+    for cell in ws[1]:
+        if cell.value is not None:
+            header_name = str(cell.value).strip()
+            header_map[header_name] = cell.column
+
+    return header_map
+
+
+def get_by_header(ws, row_index: int, header_map: dict[str, int], header_name: str):
+    """依照欄位名稱抓資料。"""
+
+    # 先用完全一樣的欄位名稱找
+    if header_name in header_map:
+        col_index = header_map[header_name]
+        return ws.cell(row_index, col_index).value
+
+    # 如果找不到，就用去掉前後空白的方式找
+    target = header_name.strip()
+
+    for key, col_index in header_map.items():
+        if key.strip() == target:
+            return ws.cell(row_index, col_index).value
+
+    raise KeyError(f"問卷表單找不到欄位：{header_name}")
+
+
+# =====================================================
+# 核心功能
+# =====================================================
+
+def fill_order(template_path: Path, output_path: Path, row_data: dict) -> None:
+    """把一筆問卷資料填進模板，另存成新的 Excel。"""
+
+    wb = load_workbook(template_path)
+    ws = wb[TEMPLATE_SHEET]
+
+    birthday = parse_date(row_data["birthday"])
+    sample_date = parse_date(row_data["sample_date"])
+    sample_time = parse_time(row_data["sample_time"])
+
+    area, lab_name, address, display_lab = parse_lab(row_data["lab_raw"])
+
+    ws[TARGET_CELLS["name"]] = row_data["name"]
+    ws[TARGET_CELLS["id_no"]] = row_data["id_no"]
+    ws[TARGET_CELLS["birthday"]] = birthday.strftime("%Y/%m/%d")
+    ws[TARGET_CELLS["lab"]] = display_lab
+    ws[TARGET_CELLS["address"]] = address
+
+    ws[TARGET_CELLS["year"]] = sample_date.year
+    ws[TARGET_CELLS["month"]] = sample_date.month
+    ws[TARGET_CELLS["day"]] = sample_date.day
+
+    ws[TARGET_CELLS["hour"]] = sample_time.hour
+    ws[TARGET_CELLS["minute"]] = f"{sample_time.minute:02d}"
+
+    wb.save(output_path)
+
+
+def generate_files(
+    form_path: str | Path,
+    template_path: str | Path,
+    output_dir: str | Path
+) -> list[Path]:
+    """讀取問卷表單，每一列產生一個新的 xlsx。"""
+
+    form_path = Path(form_path)
+    template_path = Path(template_path)
+    output_dir = Path(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    form_wb = load_workbook(form_path, data_only=True)
+    form_ws = form_wb.active
+
+    header_map = find_header_map(form_ws)
+
+    created_files = []
+
+    for row_index in range(2, form_ws.max_row + 1):
+        name = clean_text(
+            get_by_header(form_ws, row_index, header_map, COL_NAME)
+        )
+
+        # 如果姓名是空的，代表這列可能沒有資料，直接跳過
+        if not name:
+            continue
+
+        id_no = clean_text(
+            get_by_header(form_ws, row_index, header_map, COL_ID)
+        )
+
+        birthday = get_by_header(
+            form_ws, row_index, header_map, COL_BIRTHDAY
+        )
+
+        lab_raw = clean_text(
+            get_by_header(form_ws, row_index, header_map, COL_LAB)
+        )
+
+        sample_date_raw = get_by_header(
+            form_ws, row_index, header_map, COL_SAMPLE_DATE
+        )
+
+        sample_time_raw = get_by_header(
+            form_ws, row_index, header_map, COL_SAMPLE_TIME
+        )
+
+        sample_date = parse_date(sample_date_raw)
+        area, lab_name, address, display_lab = parse_lab(lab_raw)
+
+        filename = (
+            f"{sample_date:%Y%m%d}_"
+            f"{safe_filename(name)}_"
+            f"{safe_filename(area + '-' + lab_name)}.xlsx"
+        )
+
+        output_path = output_dir / filename
+
+        row_data = {
+            "name": name,
+            "id_no": id_no,
+            "birthday": birthday,
+            "lab_raw": lab_raw,
+            "sample_date": sample_date_raw,
+            "sample_time": sample_time_raw,
+        }
+
+        fill_order(template_path, output_path, row_data)
+
+        created_files.append(output_path)
+
+    return created_files
+
+
+# =====================================================
+# GUI App
+# =====================================================
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+
+        self.title("採檢預約單批次產生器")
+        self.geometry("760x280")
+
+        self.form_var = tk.StringVar()
+        self.template_var = tk.StringVar()
+        self.output_var = tk.StringVar()
+
+        self.build_ui()
+
+    def build_ui(self):
+        tk.Label(self, text="問卷表單.xlsx").grid(
+            row=0, column=0, padx=10, pady=10, sticky="w"
+        )
+
+        tk.Entry(self, textvariable=self.form_var, width=75).grid(
+            row=0, column=1, padx=10
+        )
+
+        tk.Button(self, text="選擇", command=self.choose_form).grid(
+            row=0, column=2, padx=10
+        )
+
+        tk.Label(self, text="預約單模板.xlsx").grid(
+            row=1, column=0, padx=10, pady=10, sticky="w"
+        )
+
+        tk.Entry(self, textvariable=self.template_var, width=75).grid(
+            row=1, column=1, padx=10
+        )
+
+        tk.Button(self, text="選擇", command=self.choose_template).grid(
+            row=1, column=2, padx=10
+        )
+
+        tk.Label(self, text="輸出資料夾").grid(
+            row=2, column=0, padx=10, pady=10, sticky="w"
+        )
+
+        tk.Entry(self, textvariable=self.output_var, width=75).grid(
+            row=2, column=1, padx=10
+        )
+
+        tk.Button(self, text="選擇", command=self.choose_output).grid(
+            row=2, column=2, padx=10
+        )
+
+        tk.Button(
+            self,
+            text="開始產生 Excel",
+            command=self.run_generate,
+            height=2,
+            width=20
+        ).grid(row=3, column=1, pady=25)
+
+    def choose_form(self):
+        path = filedialog.askopenfilename(
+            title="選擇問卷表單",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+
+        if path:
+            self.form_var.set(path)
+
+    def choose_template(self):
+        path = filedialog.askopenfilename(
+            title="選擇預約單模板",
+            filetypes=[("Excel files", "*.xlsx")]
+        )
+
+        if path:
+            self.template_var.set(path)
+
+    def choose_output(self):
+        path = filedialog.askdirectory(
+            title="選擇輸出資料夾"
+        )
+
+        if path:
+            self.output_var.set(path)
+
+    def run_generate(self):
+        try:
+            if not self.form_var.get():
+                messagebox.showwarning("缺少資料", "請選擇問卷表單。")
+                return
+
+            if not self.template_var.get():
+                messagebox.showwarning("缺少資料", "請選擇預約單模板。")
+                return
+
+            if not self.output_var.get():
+                messagebox.showwarning("缺少資料", "請選擇輸出資料夾。")
+                return
+
+            files = generate_files(
+                self.form_var.get(),
+                self.template_var.get(),
+                self.output_var.get()
+            )
+
+            messagebox.showinfo(
+                "完成",
+                f"已產生 {len(files)} 個 Excel 檔案。"
+            )
+
+        except Exception as e:
+            messagebox.showerror("錯誤", str(e))
+
+
+if __name__ == "__main__":
+    App().mainloop()
