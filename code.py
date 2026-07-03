@@ -35,10 +35,12 @@ def safe_name(x):
 def parse_date(x):
     if isinstance(x, datetime):
         return x.date()
+
     if isinstance(x, date):
         return x
 
     x = clean(x)
+
     for fmt in ["%Y/%m/%d", "%Y-%m-%d", "%Y.%m.%d", "%Y%m%d"]:
         try:
             return datetime.strptime(x, fmt).date()
@@ -51,10 +53,12 @@ def parse_date(x):
 def parse_time(x):
     if isinstance(x, datetime):
         return x.time()
+
     if isinstance(x, time):
         return x
 
-    x = clean(x).replace("上午", "AM ").replace("下午", "PM ")
+    x = clean(x)
+    x = x.replace("上午", "AM ").replace("下午", "PM ")
 
     for fmt in ["%p %I:%M:%S", "%p %I:%M", "%H:%M:%S", "%H:%M"]:
         try:
@@ -66,23 +70,41 @@ def parse_time(x):
 
 
 def parse_lab(x):
+    """
+    原始格式範例：
+    南投 - 貝爾醫事研究所 (南投縣南投市...)
+
+    回傳：
+    area = 南投
+    lab = 貝爾醫事研究所
+    address = 南投縣南投市...
+    display_lab = 貝爾醫事研究所
+    """
+
     x = clean(x)
+
     m = re.match(r"^(.*?)\s*-\s*(.*?)\s*\((.*?)\)\s*$", x)
 
     if m:
         area = clean(m.group(1))
         lab = clean(m.group(2))
         address = clean(m.group(3))
-        return area, lab, address, f"{area} - {lab}"
+
+        # 這裡改成只顯示檢驗所名稱，不顯示「南投 -」
+        display_lab = lab
+
+        return area, lab, address, display_lab
 
     return "", x, "", x
 
 
 def get(row, headers, name):
     name = name.strip()
+
     for key, col in headers.items():
         if key.strip() == name:
             return row[col - 1]
+
     raise KeyError(f"找不到欄位：{name}")
 
 
@@ -96,6 +118,7 @@ headers = {
     for cell in form_ws[1]
     if cell.value is not None
 }
+
 
 for row in form_ws.iter_rows(min_row=2, values_only=True):
     name = clean(get(row, headers, "姓名"))
@@ -118,7 +141,10 @@ for row in form_ws.iter_rows(min_row=2, values_only=True):
     ws[CELLS["姓名"]] = name
     ws[CELLS["身分證"]] = id_no
     ws[CELLS["生日"]] = birthday.strftime("%Y/%m/%d")
+
+    # 這裡會填入「貝爾醫事研究所」，不會填入「南投 - 貝爾醫事研究所」
     ws[CELLS["檢驗所"]] = display_lab
+
     ws[CELLS["地址"]] = address
 
     ws[CELLS["年"]] = sample_date.year
@@ -127,9 +153,12 @@ for row in form_ws.iter_rows(min_row=2, values_only=True):
     ws[CELLS["時"]] = sample_time.hour
     ws[CELLS["分"]] = f"{sample_time.minute:02d}"
 
+    # 檔名仍保留地區，方便你辨識是哪個縣市的檢驗所
     filename = f"{sample_date:%Y%m%d}_{safe_name(name)}_{safe_name(area + '-' + lab)}.xlsx"
+
     wb.save(Path(OUTPUT_DIR) / filename)
 
     print("已產生：", filename)
+
 
 print("全部完成")
